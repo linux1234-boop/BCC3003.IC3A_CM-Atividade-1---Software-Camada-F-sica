@@ -1,0 +1,2 @@
+# BCC3003.IC3A_CM-Atividade-1---Software-Camada-F-sica
+A Camada Física do modelo ISO/OSI tem como responsabilidade primária a transmissão de bits brutos ( raw bits ) sobre um meio de comunicação de dados. Nesta atividade você deve implementar e analisar um sistema completo de comunicação digital que utiliza o meio acústico ondas sonoras no ar para transmitir informações binárias entre dispositivos.
