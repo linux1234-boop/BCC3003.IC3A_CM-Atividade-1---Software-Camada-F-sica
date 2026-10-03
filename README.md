@@ -1,6 +1,8 @@
 # BCC3003.IC3A_CM-Atividade-1---Software-Camada-Fisica
 A Camada Física do modelo ISO/OSI tem como responsabilidade primária a transmissão de bits brutos ( raw bits ) sobre um meio de comunicação de dados. Nesta atividade você deve implementar e analisar um sistema completo de comunicação digital que utiliza o meio acústico ondas sonoras no ar para transmitir informações binárias entre dispositivos.
 
+Link do video: https://drive.google.com/file/d/1bbI4bofLx3arQTaKHxsCEdrJbILrPwWm/view?usp=sharing
+
 1. Fundamentação Teórica
 Modelo ISO/OSI (Visão Geral)
 O modelo de referência OSI (Open Systems Interconnection) divide as redes de computadores em 7 camadas lógicas:
