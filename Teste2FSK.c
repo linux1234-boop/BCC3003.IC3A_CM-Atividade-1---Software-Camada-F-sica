@@ -1,6 +1,5 @@
 /*
- * LICENÇA MIT
- * MÓDULO MÉTODO 2: BATIDAS (Silêncio + Batida + Silêncio) + Soma dos Bits (17 Bits)
+ * MÓDULO MÉTODO 2: FSK (Frequência) + Goertzel + Assíncrono (Som/Silêncio)
  */
 
 #include <stdio.h>
@@ -17,21 +16,42 @@
 #define SAMPLE_RATE 44100
 #define PI 3.14159265358979323846f
 
-/* --- PARÂMETROS DO RECETOR --- */
-#define AUDIO_THRESHOLD 0.30f           // Sensibilidade ajustada para estabilidade
-#define SILENCIO_PREVIO_SAMPLES 8820    // 200ms de silêncio obrigatório antes
-#define JANELA_BATIDAS_SAMPLES 17640    // 400ms para dar a 1ª e 2ª batidas
-#define DEBOUNCE_SAMPLES 4410           // 100ms entre batidas para não contar em duplicado
-#define SILENCIO_POSTERIOR_SAMPLES 8820 // 200ms de silêncio obrigatório depois
+/* --- PARÂMETROS FSK --- */
+#define FREQ_0 1200.0f
+#define FREQ_1 2200.0f
 
-/* --- PARÂMETROS DO EMISSOR --- */
-#define FREQ_BEEP 1500.0f
-#define BEEP_DURACAO_SAMPLES 2205       // 50ms (simula o impacto de uma batida)
+#define TONE_DURATION_MS 60
+#define SILENCE_DURATION_MS 60
+#define TONE_SAMPLES ((SAMPLE_RATE * TONE_DURATION_MS) / 1000)
+#define SILENCE_SAMPLES ((SAMPLE_RATE * SILENCE_DURATION_MS) / 1000)
 
-#define ESTADO_SILENCIO_PREVIO 0
-#define ESTADO_ESPERA_BATIDA 1
-#define ESTADO_JANELA_BATIDAS 2
-#define ESTADO_SILENCIO_POSTERIOR 3
+/* Parametros do Recetor / Goertzel */
+#define TAMANHO_BLOCO_MS 20
+#define TAMANHO_BLOCO_SAMPLES ((SAMPLE_RATE * TAMANHO_BLOCO_MS) / 1000)
+
+#define TONE_THRESHOLD_HIGH 2.0f
+#define TONE_THRESHOLD_LOW  0.5f
+
+#define ESTADO_ESPERA_TOM 0
+#define ESTADO_ESPERA_SILENCIO 1
+
+/* --- MATEMÁTICA: ALGORITMO DE GOERTZEL --- */
+float goertzel_mag(const float* amostras, int num_amostras, float freq_alvo) {
+    int k = (int)(0.5 + ((num_amostras * freq_alvo) / SAMPLE_RATE));
+    float omega = (2.0f * PI * k) / num_amostras;
+    float seno = sinf(omega);
+    float cosseno = cosf(omega);
+    float coeff = 2.0f * cosseno;
+    float q0 = 0, q1 = 0, q2 = 0;
+
+    for (int i = 0; i < num_amostras; i++) {
+        q0 = coeff * q1 - q2 + amostras[i];
+        q2 = q1;
+        q1 = q0;
+    }
+    float magnitude = sqrtf(q1 * q1 + q2 * q2 - q1 * q2 * coeff);
+    return magnitude;
+}
 
 /* --- DETEÇÃO DE ERROS: SOMA DOS BITS --- */
 uint8_t calcular_soma_bits(uint8_t byte_dados) {
@@ -42,40 +62,127 @@ uint8_t calcular_soma_bits(uint8_t byte_dados) {
     return soma;
 }
 
-/* --- ESTADO DO RECETOR --- */
+/* =========================================================================
+   EMISSOR (TX) - Geração de Som
+   ========================================================================= */
+typedef struct {
+    float* buffer;
+    int total_samples;
+    int cursor;
+} EmissorContexto;
+
+void emissor_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    EmissorContexto* ctx = (EmissorContexto*)pDevice->pUserData;
+    float* pOut = (float*)pOutput;
+    for (ma_uint32 i = 0; i < frameCount; i++) {
+        if (ctx->cursor < ctx->total_samples) {
+            pOut[i] = ctx->buffer[ctx->cursor++];
+        } else {
+            pOut[i] = 0.0f;
+        }
+    }
+    (void)pInput;
+}
+
+void transmitir_caractere_fsk(char c) {
+    uint8_t dados = (uint8_t)c;
+    uint8_t soma = calcular_soma_bits(dados);
+    
+    // Constrói o quadro: 1 (Start) + 8 (Dados) + 8 (Soma) = 17 bits no total
+    uint32_t quadro = 0;
+    quadro |= 1;                     // Start bit (Sempre 1)
+    quadro |= (dados << 1);          // Coloca os dados
+    quadro |= (soma << 9);           // Coloca a assinatura (Soma) no final
+
+    int total_bits = 17;
+    int amostras_por_bit = TONE_SAMPLES + SILENCE_SAMPLES;
+    int total_amostras = total_bits * amostras_por_bit;
+    
+    float* buffer_tx = (float*)malloc(total_amostras * sizeof(float));
+    int idx = 0;
+
+    // Gera a onda sonora bit a bit
+    for (int b = 0; b < total_bits; b++) {
+        int bit = (quadro >> b) & 1;
+        float freq = (bit == 1) ? FREQ_1 : FREQ_0;
+        
+        // 1. Gera o Som (60ms)
+        for (int i = 0; i < TONE_SAMPLES; i++) {
+            float tempo = (float)i / SAMPLE_RATE;
+            buffer_tx[idx++] = 0.5f * sinf(2.0f * PI * freq * tempo);
+        }
+        // 2. Gera o Silêncio separador (60ms)
+        for (int i = 0; i < SILENCE_SAMPLES; i++) {
+            buffer_tx[idx++] = 0.0f;
+        }
+    }
+
+    EmissorContexto ctx;
+    ctx.buffer = buffer_tx;
+    ctx.total_samples = total_amostras;
+    ctx.cursor = 0;
+
+    ma_device_config config = ma_device_config_init(ma_device_type_playback);
+    config.playback.format = ma_format_f32;
+    config.playback.channels = 1;
+    config.sampleRate = SAMPLE_RATE;
+    config.dataCallback = emissor_callback;
+    config.pUserData = &ctx;
+
+    ma_device device;
+    if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
+        printf("Erro ao iniciar alto-falante.\n");
+        free(buffer_tx);
+        return;
+    }
+
+    ma_device_start(&device);
+    printf("\nA Transmitir: Letra '%c' (Dados: %d, Soma: %d)\n", c, dados, soma);
+    
+    // Aguarda o som acabar de tocar
+    while (ctx.cursor < ctx.total_samples) {
+        ma_sleep(10);
+    }
+    ma_sleep(100); // pequena pausa de segurança
+    
+    ma_device_uninit(&device);
+    free(buffer_tx);
+}
+
+
+/* =========================================================================
+   RECETOR (RX) - Captura de Som e Máquina de Estados
+   ========================================================================= */
 typedef struct {
     int estado;
-    int temporizador;
-    int tempo_desde_ultimo_pico;
-
-    int batidas_no_simbolo;
     int bits_recebidos;
-    uint32_t quadro_buffer; 
+    uint32_t quadro_buffer;
+    
+    float bloco_analise[TAMANHO_BLOCO_SAMPLES];
+    int index_bloco;
     
     char interface_estado[128];
     char interface_rodape[128];
     bool precisa_redesenhar;
-} ReceptorBatidas;
+} ReceptorFSK;
 
-/* --- INTERFACE DO TERMINAL --- */
-void desenhar_interface(ReceptorBatidas *ctx) {
+void desenhar_interface(ReceptorFSK *ctx) {
     printf("\033[H\033[J");
     printf("============================================================\n");
-    printf("   CAMADA FISICA - METODO 2 (Batidas Exatas + Soma de Bits)\n");
+    printf("   CAMADA FISICA - METODO 2 (FSK + Goertzel + Assincrono)\n");
     printf("============================================================\n\n");
     
     printf("Estado Atual: %s\n", ctx->interface_estado);
-    printf("Progresso do Quadro (17 bits): %d / 17\n", ctx->bits_recebidos);
-    printf("Batidas registadas no bit atual: %d\n\n", ctx->batidas_no_simbolo);
+    printf("Progresso do Quadro: %d / 17 bits\n\n", ctx->bits_recebidos);
     
-    printf("Bits desmodulados: ");
+    printf("Bits recebidos no ar: ");
     for(int i = 0; i < ctx->bits_recebidos; i++) {
         printf("%d", (ctx->quadro_buffer >> i) & 1);
     }
     printf("\n\n");
     printf("Codificacao:\n");
-    printf("Bit 0 = Silencio + 1 Batida  + Silencio\n");
-    printf("Bit 1 = Silencio + 2 Batidas + Silencio\n");
+    printf("Bit 0 = 1200 Hz (60ms) -> Silencio (60ms)\n");
+    printf("Bit 1 = 2200 Hz (60ms) -> Silencio (60ms)\n");
     printf("Frame = [1 Start Bit] + [8 Bits Dados] + [8 Bits Soma]\n\n");
     printf("[q] Sair do Receptor     [r] Reiniciar\n\n");
     printf("-> %s\n", ctx->interface_rodape);
@@ -83,190 +190,81 @@ void desenhar_interface(ReceptorBatidas *ctx) {
     ctx->precisa_redesenhar = false;
 }
 
-/* --- CALLBACK DO MICROFONE --- */
-void captura_batidas_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    ReceptorBatidas* ctx = (ReceptorBatidas*)pDevice->pUserData;
+void captura_fsk_continuo_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    ReceptorFSK* ctx = (ReceptorFSK*)pDevice->pUserData;
     const float* pAmostras = (const float*)pInput;
     if (pAmostras == NULL) return;
 
     for (ma_uint32 i = 0; i < frameCount; i++) {
-        float amostra = pAmostras[i];
-        bool pico_detetado = (fabsf(amostra) > AUDIO_THRESHOLD);
-
-        // ESTADO 0: Exige silêncio
-        if (ctx->estado == ESTADO_SILENCIO_PREVIO) {
-            if (pico_detetado) {
-                ctx->temporizador = 0; 
-            } else {
-                ctx->temporizador++;
-                if (ctx->temporizador > SILENCIO_PREVIO_SAMPLES) {
-                    ctx->estado = ESTADO_ESPERA_BATIDA;
-                    strcpy(ctx->interface_estado, "Silencio validado. Aguardar batida...");
-                    ctx->precisa_redesenhar = true;
-                }
-            }
-        } 
-        // ESTADO 1: Aguarda a 1ª batida
-        else if (ctx->estado == ESTADO_ESPERA_BATIDA) {
-            if (pico_detetado) {
-                ctx->estado = ESTADO_JANELA_BATIDAS;
-                ctx->batidas_no_simbolo = 1;
-                ctx->temporizador = 0;
-                ctx->tempo_desde_ultimo_pico = 0;
-                strcpy(ctx->interface_estado, "1a Batida! Aguardar 2a ou fecho da janela...");
-                ctx->precisa_redesenhar = true;
-            }
-        } 
-        // ESTADO 2: Janela aberta (400ms)
-        else if (ctx->estado == ESTADO_JANELA_BATIDAS) {
-            ctx->temporizador++;
-            ctx->tempo_desde_ultimo_pico++;
-
-            if (pico_detetado && ctx->tempo_desde_ultimo_pico > DEBOUNCE_SAMPLES) {
-                ctx->batidas_no_simbolo++;
-                ctx->tempo_desde_ultimo_pico = 0;
-                sprintf(ctx->interface_estado, "%d Batidas registadas!", ctx->batidas_no_simbolo);
-                ctx->precisa_redesenhar = true;
-            }
-
-            if (ctx->temporizador > JANELA_BATIDAS_SAMPLES) {
-                ctx->estado = ESTADO_SILENCIO_POSTERIOR;
-                ctx->temporizador = 0;
-                strcpy(ctx->interface_estado, "Janela fechada. A validar silencio posterior...");
-                ctx->precisa_redesenhar = true;
-            }
-        } 
-        // ESTADO 3: Valida silêncio após batidas
-        else if (ctx->estado == ESTADO_SILENCIO_POSTERIOR) {
-            if (pico_detetado) {
-                ctx->estado = ESTADO_SILENCIO_PREVIO;
-                ctx->temporizador = 0;
-                strcpy(ctx->interface_rodape, "\033[0;31m[ERRO]\033[0m Ruido no silencio posterior. Bit anulado.");
-                ctx->precisa_redesenhar = true;
-            } else {
-                ctx->temporizador++;
-                if (ctx->temporizador > SILENCIO_POSTERIOR_SAMPLES) {
-                    bool bit_valido = false;
+        ctx->bloco_analise[ctx->index_bloco++] = pAmostras[i];
+        
+        // Quando enche um bloco de 20ms, analisa com Goertzel
+        if (ctx->index_bloco >= TAMANHO_BLOCO_SAMPLES) {
+            float mag0 = goertzel_mag(ctx->bloco_analise, TAMANHO_BLOCO_SAMPLES, FREQ_0);
+            float mag1 = goertzel_mag(ctx->bloco_analise, TAMANHO_BLOCO_SAMPLES, FREQ_1);
+            
+            // ESTADO 0: À procura de som (Tom)
+            if (ctx->estado == ESTADO_ESPERA_TOM) {
+                if (mag0 > TONE_THRESHOLD_HIGH || mag1 > TONE_THRESHOLD_HIGH) {
+                    int bit_lido = (mag1 > mag0) ? 1 : 0;
                     
-                    if (ctx->batidas_no_simbolo == 1) {
-                        ctx->quadro_buffer |= (0 << ctx->bits_recebidos);
-                        bit_valido = true;
-                    } else if (ctx->batidas_no_simbolo == 2) {
-                        ctx->quadro_buffer |= (1 << ctx->bits_recebidos);
-                        bit_valido = true;
-                    }
-
-                    if (bit_valido) {
-                        ctx->bits_recebidos++;
-                        sprintf(ctx->interface_rodape, "Bit %d validado com sucesso.", (ctx->batidas_no_simbolo == 2) ? 1 : 0);
+                    ctx->quadro_buffer |= (bit_lido << ctx->bits_recebidos);
+                    ctx->bits_recebidos++;
+                    ctx->estado = ESTADO_ESPERA_SILENCIO; // Avança para Estado 1
+                    
+                    sprintf(ctx->interface_estado, "Som detetado (Bit %d)! A aguardar silencio...", bit_lido);
+                    ctx->precisa_redesenhar = true;
+                    
+                    // Se recebemos os 17 bits completos, vamos validar
+                    if (ctx->bits_recebidos == 17) {
+                        uint8_t start_bit = ctx->quadro_buffer & 0x01;
+                        uint8_t dados = (ctx->quadro_buffer >> 1) & 0xFF;
+                        uint8_t soma_recebida = (ctx->quadro_buffer >> 9) & 0xFF;
                         
-                        // FINAL DO QUADRO DE 17 BITS
-                        if (ctx->bits_recebidos == 17) {
-                            uint8_t start_bit = ctx->quadro_buffer & 0x01;
-                            uint8_t dados = (ctx->quadro_buffer >> 1) & 0xFF;
-                            uint8_t soma_recebida = (ctx->quadro_buffer >> 9) & 0xFF;
-                            
-                            uint8_t soma_calculada = calcular_soma_bits(dados);
-                            char char_ascii = (dados >= 32 && dados <= 126) ? (char)dados : '?';
+                        uint8_t soma_calculada = calcular_soma_bits(dados);
+                        char char_ascii = (dados >= 32 && dados <= 126) ? (char)dados : '?';
 
-                            if (start_bit == 1 && soma_recebida == soma_calculada) {
-                                sprintf(ctx->interface_rodape, "\033[0;32m[SUCESSO]\033[0m Char: '%c' | Soma Rx: %d == Calc: %d", char_ascii, soma_recebida, soma_calculada);
-                            } else {
-                                sprintf(ctx->interface_rodape, "\033[0;31m[FALHA]\033[0m Char: '%c' | Start: %d | Soma Rx: %d != Calc: %d", char_ascii, start_bit, soma_recebida, soma_calculada);
-                            }
-                            ctx->quadro_buffer = 0;
-                            ctx->bits_recebidos = 0;
+                        if (start_bit == 1 && soma_recebida == soma_calculada) {
+                            sprintf(ctx->interface_rodape, "\033[0;32m[SUCESSO]\033[0m Char: '%c' | Soma Rx: %d == Calc: %d", char_ascii, soma_recebida, soma_calculada);
+                        } else {
+                            sprintf(ctx->interface_rodape, "\033[0;31m[FALHA]\033[0m Char: '%c' | Soma Rx: %d != Calc: %d", char_ascii, soma_recebida, soma_calculada);
                         }
+                        
+                        ctx->quadro_buffer = 0;
+                        ctx->bits_recebidos = 0;
+                        ctx->estado = ESTADO_ESPERA_TOM;
+                        strcpy(ctx->interface_estado, "A aguardar START BIT...");
                     }
-
-                    ctx->estado = ESTADO_SILENCIO_PREVIO;
-                    ctx->temporizador = 0;
+                }
+            } 
+            // ESTADO 1: À procura de Silêncio
+            else if (ctx->estado == ESTADO_ESPERA_SILENCIO) {
+                if (mag0 < TONE_THRESHOLD_LOW && mag1 < TONE_THRESHOLD_LOW) {
+                    ctx->estado = ESTADO_ESPERA_TOM; // Regressa ao Estado 0
+                    strcpy(ctx->interface_estado, "Silencio validado! Pronto para proximo som...");
                     ctx->precisa_redesenhar = true;
                 }
             }
+            
+            ctx->index_bloco = 0; // Prepara para a próxima análise de 20ms
         }
     }
     (void)pOutput;
 }
 
-/* --- MÓDULO EMISSOR (GERA AS BATIDAS AUTOMATICAMENTE) --- */
-void transmitir_caractere_batidas(char caractere) {
-    uint8_t dados = (uint8_t)caractere;
-    uint8_t soma = calcular_soma_bits(dados);
-    uint32_t quadro = 1 | (dados << 1) | (soma << 9);
-    
-    // O Emissor dá 250ms de silêncio para garantir que o Recetor passa dos 200ms
-    int tx_silencio_previo = 11025; // 250ms
-    int tx_janela = 17640;          // 400ms
-    int tx_silencio_post = 11025;   // 250ms
-    int samples_por_bit = tx_silencio_previo + tx_janela + tx_silencio_post;
-    
-    size_t total_samples = 17 * samples_por_bit;
-    float* pcm_buffer = (float*)calloc(total_samples, sizeof(float));
-    
-    float phase = 0.0f;
-    int idx = 0;
-    
-    for (int b = 0; b < 17; b++) {
-        int bit = (quadro >> b) & 1;
-        
-        // 1. Silêncio Prévio
-        for (int s = 0; s < tx_silencio_previo; s++) {
-            pcm_buffer[idx++] = 0.0f;
-        }
-        
-        // 2. Janela de Batidas
-        for (int s = 0; s < tx_janela; s++) {
-            bool tocar_beep = false;
-            
-            if (s < BEEP_DURACAO_SAMPLES) tocar_beep = true; // 1a batida no inicio da janela
-            if (bit == 1 && s >= 6615 && s < (6615 + BEEP_DURACAO_SAMPLES)) tocar_beep = true; // 2a batida aos 150ms
-            
-            if (tocar_beep) {
-                pcm_buffer[idx++] = sinf(phase) * 0.8f; 
-                phase += 2.0f * PI * FREQ_BEEP / SAMPLE_RATE;
-                if (phase > 2.0f * PI) phase -= 2.0f * PI;
-            } else {
-                pcm_buffer[idx++] = 0.0f; 
-            }
-        }
-        
-        // 3. Silêncio Posterior
-        for (int s = 0; s < tx_silencio_post; s++) {
-            pcm_buffer[idx++] = 0.0f;
-        }
-    }
 
-    ma_engine engine;
-    ma_engine_init(NULL, &engine);
-    
-    ma_audio_buffer_config bufConfig = ma_audio_buffer_config_init(ma_format_f32, 1, total_samples, pcm_buffer, NULL);
-    bufConfig.sampleRate = SAMPLE_RATE;
-    ma_audio_buffer audioBuffer;
-    ma_audio_buffer_init(&bufConfig, &audioBuffer);
-    
-    ma_sound sound;
-    ma_sound_init_from_data_source(&engine, &audioBuffer, 0, NULL, &sound);
-    ma_sound_start(&sound);
-
-    printf("A transmitir caractere '%c' por Batidas... Aguarde 15 seg.\n", caractere);
-    while (ma_sound_is_playing(&sound)) ma_sleep(100);
-
-    ma_sound_uninit(&sound);
-    ma_audio_buffer_uninit(&audioBuffer);
-    ma_engine_uninit(&engine);
-    free(pcm_buffer);
-}
-
-/* --- MENU PRINCIPAL --- */
+/* =========================================================================
+   MENU PRINCIPAL
+   ========================================================================= */
 int main() {
     int opcao = -1;
     while (opcao != 0) {
         printf("\n\033[H\033[J");
         printf("============================================================\n");
         printf("             SISTEMA DE COMUNICACAO - METODO 2              \n");
+        printf("               (FSK + Goertzel + Assincrono)                \n");
         printf("============================================================\n");
-        printf("1. [EMISSOR] Transmitir Caractere via Batidas (Auto)\n");
+        printf("1. [EMISSOR] Transmitir Caractere via Som\n");
         printf("2. [RECEPTOR] Escutar Microfone em Tempo Real\n");
         printf("0. Sair\n");
         printf("Escolha: ");
@@ -277,43 +275,47 @@ int main() {
         if (opcao == 1) {
             printf("\nDigite um unico caractere para transmitir: ");
             char c = getchar();
-            transmitir_caractere_batidas(c);
-            printf("Transmissao concluida! Prima ENTER para voltar.");
+            transmitir_caractere_fsk(c);
+            printf("Prima ENTER para voltar ao menu.");
             getchar(); getchar();
         } 
         else if (opcao == 2) {
             ma_device_config deviceConfig = ma_device_config_init(ma_device_type_capture);
             ma_device device;
-            ReceptorBatidas ctx;
-            memset(&ctx, 0, sizeof(ReceptorBatidas));
+            ReceptorFSK ctx;
+            memset(&ctx, 0, sizeof(ReceptorFSK));
             
-            ctx.estado = ESTADO_SILENCIO_PREVIO;
-            strcpy(ctx.interface_estado, "A verificar silencio inicial...");
-            strcpy(ctx.interface_rodape, "Pronto para receber dados.");
+            ctx.estado = ESTADO_ESPERA_TOM;
+            strcpy(ctx.interface_estado, "A aguardar START BIT...");
+            strcpy(ctx.interface_rodape, "Microfone ligado. Pronto para receber.");
             ctx.precisa_redesenhar = true;
 
             deviceConfig.capture.format = ma_format_f32;
             deviceConfig.capture.channels = 1;
             deviceConfig.sampleRate = SAMPLE_RATE;
-            deviceConfig.dataCallback = captura_batidas_callback;
+            deviceConfig.dataCallback = captura_fsk_continuo_callback;
             deviceConfig.pUserData = &ctx;
 
-            ma_device_init(NULL, &deviceConfig, &device);
+            if (ma_device_init(NULL, &deviceConfig, &device) != MA_SUCCESS) {
+                printf("Erro: O microfone não está disponível!\n");
+                continue;
+            }
             ma_device_start(&device);
 
             bool rodando = true;
             while (rodando) {
                 if (ctx.precisa_redesenhar) desenhar_interface(&ctx);
+                
                 if (_kbhit()) {
                     char tecla = _getch();
                     if (tecla == 'q' || tecla == 'Q') rodando = false;
                     else if (tecla == 'r' || tecla == 'R') {
                         ctx.bits_recebidos = 0;
-                        ctx.batidas_no_simbolo = 0;
                         ctx.quadro_buffer = 0;
-                        ctx.estado = ESTADO_SILENCIO_PREVIO;
-                        strcpy(ctx.interface_estado, "A verificar silencio inicial...");
-                        strcpy(ctx.interface_rodape, "Transmissao reiniciada."); 
+                        ctx.estado = ESTADO_ESPERA_TOM;
+                        ctx.index_bloco = 0;
+                        strcpy(ctx.interface_estado, "A aguardar START BIT...");
+                        strcpy(ctx.interface_rodape, "Reset manual feito. Pronto para receber."); 
                         ctx.precisa_redesenhar = true;
                     }
                 }
